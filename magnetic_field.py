@@ -40,7 +40,7 @@ from torch.optim import Adam
 # ===============
 # USER SETTINGS
 # ===============
-JSON_PATH = "new_expirement_3drop_rotated.json"  # <-- set your file
+JSON_PATH = os.getenv("JSON_PATH", "new_expirement_3drop_rotated.json")  # <-- set your file
 # Image geometry (must match JSON meta)
 H_img, W_img = 768, 1194
 Lx, Ly = 0.03, 0.01           # meters
@@ -52,7 +52,10 @@ CONST_FIELD_AXIS = 'y'        # 'x' or 'y' if constant field is used
 CONST_FIELD_H0   = 1.0        # A/m (scale can be learned by alpha anyway)
 
 # Training
-MAX_ITERS = 12000
+try:
+    MAX_ITERS = int(os.getenv("MAX_ITERS", "12000"))
+except Exception:
+    MAX_ITERS = 12000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 123
 
@@ -123,41 +126,53 @@ def load_json_iso(json_path: str) -> Tuple[List[FrameData], Dict[str, Any]]:
     dx = Lx / Wj
     dy = Ly / Hj
 
-    def frame_key_to_int(k: str) -> int:
-        try:
-            return int(k.split("_")[-1])
-        except Exception:
-            return 0
-
-    frame_keys = sorted([k for k in J.keys() if k.startswith("frame_")], key=frame_key_to_int)
-    if not frame_keys and "frames" in J:
-        frame_keys = ["frames"]
-
     frames: List[FrameData] = []
     ts_abs = []
 
-    for fidx, k in enumerate(frame_keys):
-        items = J[k] if isinstance(J[k], list) else J["frames"]
-        if not items:
-            continue
-
+    # Support two formats:
+    # 1) {'frames': [ { 'contour'|`polygon`: [[x,y],...], 't': <opt> }, ... ]}
+    # 2) {'frame_000': { ... }, 'frame_001': { ... }, ...}
+    if "frames" in J and isinstance(J["frames"], list):
+        items = J["frames"]
         for didx, it in enumerate(items):
             poly = np.array(it.get("polygon", it.get("contour")), dtype=np.float32)
             if poly.ndim != 2 or poly.shape[1] != 2:
                 continue
-
             if poly.max() <= 1.0:
                 poly[:, 0] *= (Wj - 1)
                 poly[:, 1] *= (Hj - 1)
-
             area_m = abs(polygon_area_meters(poly, dx, dy))
             area_iso = area_m / (s_iso ** 2)
-
             xs_iso = (poly[:, 0] * dx) / s_iso
             ys_iso = (poly[:, 1] * dy) / s_iso
             cnt_iso = np.stack([xs_iso, ys_iso], 1).astype(np.float32)
-
-            t_abs = float(fidx)
+            t_abs = float(it.get("t", didx))
+            frames.append(FrameData(t=t_abs, tn=0.0, contour_iso=cnt_iso, area_iso=area_iso))
+            ts_abs.append(t_abs)
+    else:
+        # Per-key frames: sort by numeric suffix
+        def frame_key_to_int(k: str) -> int:
+            try:
+                return int(k.split("_")[-1])
+            except Exception:
+                return 0
+        keys = sorted([k for k in J.keys() if k.startswith("frame_")], key=frame_key_to_int)
+        for fidx, k in enumerate(keys):
+            it = J[k]
+            if not isinstance(it, dict):
+                continue
+            poly = np.array(it.get("polygon", it.get("contour")), dtype=np.float32)
+            if poly.ndim != 2 or poly.shape[1] != 2:
+                continue
+            if poly.max() <= 1.0:
+                poly[:, 0] *= (Wj - 1)
+                poly[:, 1] *= (Hj - 1)
+            area_m = abs(polygon_area_meters(poly, dx, dy))
+            area_iso = area_m / (s_iso ** 2)
+            xs_iso = (poly[:, 0] * dx) / s_iso
+            ys_iso = (poly[:, 1] * dy) / s_iso
+            cnt_iso = np.stack([xs_iso, ys_iso], 1).astype(np.float32)
+            t_abs = float(it.get("t", fidx))
             frames.append(FrameData(t=t_abs, tn=0.0, contour_iso=cnt_iso, area_iso=area_iso))
             ts_abs.append(t_abs)
 
@@ -209,7 +224,7 @@ class FieldProvider:
             if not os.path.exists(p):
                 return None
             arr = np.load(p)
-            # Accept (T,1,H,W) or (1,H,W) or (H,W)
+            # Accept (T,1,H,W) or (T,H,W) or (H,W)
             if arr.ndim == 4:
                 pass  # (T,1,H,W)
             elif arr.ndim == 3:
@@ -220,13 +235,13 @@ class FieldProvider:
                 arr = arr[None, None, :, :]
             else:
                 raise ValueError(f"Unsupported field map shape {arr.shape} for {p}")
-            # If time dim = 1 and we expect more, repeat
-            if arr.shape[0] == 1 and T_expected > 1:
-                arr = np.repeat(arr, T_expected, axis=0)
-            elif arr.shape[0] != T_expected:
-                # Clip to min(T)
-                T_use = min(arr.shape[0], T_expected)
-                arr = arr[:T_use]
+            # Match expected T by repeating along time if needed
+            T_have = arr.shape[0]
+            if T_have < T_expected:
+                reps = int(math.ceil(T_expected / float(T_have)))
+                arr = np.tile(arr, (reps, 1, 1, 1))[:T_expected]
+            elif T_have > T_expected:
+                arr = arr[:T_expected]
             return torch.from_numpy(arr.astype(np.float32)).to(device)
 
         Hx = _try_load(path_x)
@@ -268,13 +283,15 @@ class FieldProvider:
         Hx_out = torch.empty((xy.shape[0], 1), device=xy.device)
         Hy_out = torch.empty((xy.shape[0], 1), device=xy.device)
         uniq = fid.unique()
+        max_t = getattr(self, 'field_T', 1) - 1
         for k in uniq.tolist():
             msk = (fid == k)
             if msk.sum() == 0:
                 continue
+            k_clamped = int(max(0, min(int(k), max_t)))
             grid_k = grid[:, :, msk.nonzero(as_tuple=False).squeeze(1), :]
-            Hxk = F.grid_sample(self.Hx[k:k+1], grid_k, mode="bilinear", align_corners=True)
-            Hyg = F.grid_sample(self.Hy[k:k+1], grid_k, mode="bilinear", align_corners=True)
+            Hxk = F.grid_sample(self.Hx[k_clamped:k_clamped+1], grid_k, mode="bilinear", align_corners=True)
+            Hyg = F.grid_sample(self.Hy[k_clamped:k_clamped+1], grid_k, mode="bilinear", align_corners=True)
             Hx_out[msk] = Hxk.view(-1, 1)
             Hy_out[msk] = Hyg.view(-1, 1)
         return Hx_out, Hy_out
